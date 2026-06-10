@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # minillm - Single-file LLM Inference Engine
-# Version: 0.3.0
+# Version: 0.4.0
 # License: MIT
 #
 # A self-contained LLM inference engine. Extracts, builds, and runs
@@ -45,7 +45,7 @@ set -euo pipefail
 # ---- Configuration ----------------------------------------------------------
 
 SCRIPT_NAME="$(basename "$0")"
-VERSION="0.3.0"
+VERSION="0.4.0"
 CACHE_DIR="${MINILLM_CACHE:-${HOME}/.cache/minillm}"
 SOURCE_C="${CACHE_DIR}/src/mini-llm.c"
 BINARY="${CACHE_DIR}/minillm"
@@ -353,9 +353,6 @@ static void *read_value(FILE *fp, enum gguf_type type) {
                             break;
                     }
                 }
-            }
-            break;
-        }
             }
             break;
         }
@@ -705,16 +702,6 @@ static tokenizer_t load_vocab(gguf_file_t *gf) {
             snprintf(tok.tokens[i], 8, "<%d>", i);
         }
         fprintf(stderr, "Warning: no vocab in GGUF, using placeholder tokens\n");
-    }
-
-    fprintf(stderr, "Vocab: %d tokens\n", tok.n_vocab);
-    return tok;
-}
-    }
-
-    for (int i = 0; i < tok.n_vocab; i++) {
-        tok.tokens[i] = malloc(8);
-        snprintf(tok.tokens[i], 8, "<%d>", i);
     }
 
     fprintf(stderr, "Vocab: %d tokens\n", tok.n_vocab);
@@ -1160,7 +1147,7 @@ static void *server_thread(void *arg) {
  * ============================================================ */
 
 int main(int argc, char **argv) {
-    fprintf(stderr, "mini-llm v0.1.0 - Single file LLM inference\n");
+    fprintf(stderr, "mini-llm v0.4.0 - Single file LLM inference\n");
     fprintf(stderr, "Build: %s %s\n", __DATE__, __TIME__);
 #if HAS_NEON
     fprintf(stderr, "SIMD: ARM NEON enabled\n");
@@ -1169,24 +1156,39 @@ int main(int argc, char **argv) {
 #endif
 
     if (argc < 2) {
-        fprintf(stderr, "\nUsage: %s model.gguf [prompt]\n", argv[0]);
+        fprintf(stderr, "\nUsage: %s model.gguf [prompt] [--temp N] [--max-tokens N]\n", argv[0]);
         fprintf(stderr, "  API: curl http://localhost:8080/api/generate -d '{\"prompt\":\"Hello\"}'\n");
         return 1;
     }
 
-    fprintf(stderr, "\nLoading: %s\n", argv[1]);
-    gguf_file_t gf = gguf_open(argv[1]);
+    char *model_path = argv[1];
+    char *prompt = NULL;
+    float temp = 0.8f;
+    int max_tokens = 128;
+
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc) {
+            temp = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc) {
+            max_tokens = atoi(argv[++i]);
+        } else if (!prompt) {
+            prompt = argv[i];
+        }
+    }
+
+    fprintf(stderr, "\nLoading: %s\n", model_path);
+    gguf_file_t gf = gguf_open(model_path);
 
     model_t model = load_model(&gf);
     tokenizer_t tok = load_vocab(&gf);
     g_model = &model;
     g_tok = &tok;
 
-    if (argc > 2) {
+    if (prompt) {
         char *output = calloc(65536, 1);
-        fprintf(stderr, "\nPrompt: %s\n", argv[2]);
-        fprintf(stderr, "Generating...\n\n");
-        generate(g_model, g_tok, argv[2], output, 65536, 128, 0.8f);
+        fprintf(stderr, "\nPrompt: %s\n", prompt);
+        fprintf(stderr, "Generating (temp=%.2f, max_tokens=%d)...\n\n", temp, max_tokens);
+        generate(g_model, g_tok, prompt, output, 65536, max_tokens, temp);
         fprintf(stderr, "\n");
         printf("%s", output);
         fflush(stdout);
@@ -1412,7 +1414,7 @@ generate() {
     ensure_engine
 
     info "Running inference (temp=${temperature}, max_tokens=${max_tokens})..."
-    "$BINARY" "$model" "$prompt" 2>/dev/null
+    "$BINARY" "$model" "$prompt" --temp "$temperature" --max-tokens "$max_tokens" 2>/dev/null
     echo ""
 }
 
