@@ -100,6 +100,7 @@ ${BOLD}Environment:${NC}
   MINILLM_CACHE    Cache directory (default: ~/.cache/minillm)
   MINILLM_API_URL  External API endpoint (NVIDIA, OpenAI, etc.)
   MINILLM_API_KEY  API key for external endpoint
+  MINILLM_TUNNEL   Auto-tunnel: expose local server (host:port)
 
 ${BOLD}Examples:${NC}
   ${SCRIPT_NAME} download ${YELLOW}https://huggingface.co/TheBloke/.../model.gguf${NC}
@@ -108,6 +109,11 @@ ${BOLD}Examples:${NC}
   ${SCRIPT_NAME} demo
   ${SCRIPT_NAME} chat ~/models/model.gguf
   MINILLM_PORT=9090 ${SCRIPT_NAME} ~/models/model.gguf
+
+${BOLD}Tunnel (expose local server to internet):${NC}
+  ${SCRIPT_NAME} tunnel-server [port]             Run relay on public VPS
+  ${SCRIPT_NAME} tunnel <relay-host> [port]       Expose local server via relay
+  MINILLM_TUNNEL=my.relay.com ${SCRIPT_NAME} model.gguf  Auto-tunnel
 EOF
     exit 0
 }
@@ -1734,6 +1740,296 @@ install_to_system() {
     fi
 }
 
+# ---- Custom Tunnel (Local to Public) ---------------------------------------
+# Relay server + tunnel client using Python stdlib (no external dependencies).
+# Run tunnel-server on a public VPS, tunnel client locally.
+
+TUNNEL_POLL_TIMEOUT="30"
+
+tunnel_server() {
+    local port="${1:-8081}"
+    header "Starting Tunnel Relay Server"
+    info "Listening on port ${port}"
+    info "Clients connect to this relay to expose local servers"
+    echo ""
+
+    python3 -c "
+import http.server, json, threading, queue, time, os, sys, signal
+from urllib.parse import urlparse
+
+requests_queue = {}
+responses = {}
+lock = threading.Lock()
+
+class TunnelHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        sys.stderr.write('[Relay] %s\n' % (fmt % args))
+
+    def json_resp(self, code, data):
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def read_body(self):
+        length = int(self.headers.get('Content-Length', 0))
+        return self.rfile.read(length) if length > 0 else b''
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', '*')
+        self.end_headers()
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parsed.query
+
+        if path == '/register':
+            import uuid
+            tid = uuid.uuid4().hex[:8]
+            with lock:
+                requests_queue[tid] = queue.Queue()
+            host = self.headers.get('Host', 'localhost:%d' % port)
+            self.json_resp(200, {
+                'tunnel_id': tid,
+                'public_url': 'http://%s/t/%s' % (host, tid)
+            })
+            sys.stderr.write('[Relay] Client registered: %s\n' % tid)
+
+        elif path.startswith('/poll/'):
+            tid = path.split('/')[2]
+            with lock:
+                q = requests_queue.get(tid)
+            if q is None:
+                self.json_resp(404, {'error': 'unknown tunnel'})
+                return
+            try:
+                req = q.get(timeout=${TUNNEL_POLL_TIMEOUT})
+                self.json_resp(200, req)
+            except queue.Empty:
+                self.json_resp(204, {})
+
+        elif path.startswith('/t/'):
+            parts = path.split('/')
+            if len(parts) < 3:
+                self.json_resp(400, {'error': 'bad path'})
+                return
+            tid = parts[2]
+            proxy_path = '/' + '/'.join(parts[3:]) if len(parts) > 3 else '/'
+            if query:
+                proxy_path += '?' + query
+            with lock:
+                q = requests_queue.get(tid)
+            if q is None:
+                self.json_resp(404, {'error': 'tunnel not found'})
+                return
+            import uuid
+            rid = uuid.uuid4().hex
+            body = self.read_body()
+            q.put({
+                'req_id': rid,
+                'method': 'GET',
+                'path': proxy_path,
+                'body': body.decode('utf-8', errors='replace'),
+                'headers': dict(self.headers)
+            })
+            for _ in range(300):
+                with lock:
+                    resp = responses.pop(rid, None)
+                if resp:
+                    self.send_response(resp.get('status', 200))
+                    for h in resp.get('headers', {}):
+                        self.send_header(h, resp['headers'][h])
+                    self.end_headers()
+                    self.wfile.write(resp.get('body', '').encode('utf-8'))
+                    return
+                time.sleep(0.1)
+            self.json_resp(504, {'error': 'tunnel timeout'})
+        else:
+            self.json_resp(200, {'status': 'alive', 'service': 'minillm-tunnel'})
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parsed.query
+
+        if path.startswith('/respond/'):
+            rid = path.split('/')[2]
+            data = json.loads(self.read_body())
+            with lock:
+                responses[rid] = data
+            self.json_resp(200, {'status': 'ok'})
+
+        elif path.startswith('/t/'):
+            parts = path.split('/')
+            if len(parts) < 3:
+                self.json_resp(400, {'error': 'bad path'})
+                return
+            tid = parts[2]
+            proxy_path = '/' + '/'.join(parts[3:]) if len(parts) > 3 else '/'
+            if query:
+                proxy_path += '?' + query
+            with lock:
+                q = requests_queue.get(tid)
+            if q is None:
+                self.json_resp(404, {'error': 'tunnel not found'})
+                return
+            import uuid
+            rid = uuid.uuid4().hex
+            body = self.read_body()
+            q.put({
+                'req_id': rid,
+                'method': 'POST',
+                'path': proxy_path,
+                'body': body.decode('utf-8', errors='replace'),
+                'headers': dict(self.headers)
+            })
+            for _ in range(300):
+                with lock:
+                    resp = responses.pop(rid, None)
+                if resp:
+                    self.send_response(resp.get('status', 200))
+                    for h in resp.get('headers', {}):
+                        self.send_header(h, resp['headers'][h])
+                    self.end_headers()
+                    self.wfile.write(resp.get('body', '').encode('utf-8'))
+                    return
+                time.sleep(0.1)
+            self.json_resp(504, {'error': 'tunnel timeout'})
+        else:
+            self.json_resp(404, {'error': 'not found'})
+
+def shutdown(sig, frame):
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, shutdown)
+signal.signal(signal.SIGINT, shutdown)
+
+port = int(os.environ.get('TUNNEL_PORT', '${port}'))
+server = http.server.HTTPServer(('0.0.0.0', port), TunnelHandler)
+sys.stderr.write('Tunnel relay running on port %d\n' % port)
+sys.stderr.write('Clients connect using: minillm tunnel <this-host> %d\n' % port)
+server.serve_forever()
+"
+}
+
+tunnel_client() {
+    local relay_host="$1"
+    local relay_port="${2:-8081}"
+    local local_port="${PORT}"
+
+    if [ -z "$relay_host" ]; then
+        error "Usage: $SCRIPT_NAME tunnel <relay-host> [relay-port]"
+        exit 1
+    fi
+
+    header "Starting Tunnel Client"
+    info "Relay:   ${relay_host}:${relay_port}"
+    info "Local:   localhost:${local_port}"
+    echo ""
+
+    python3 -c "
+import json, urllib.request, time, sys, os
+
+relay = 'http://${relay_host}:${relay_port}'
+local_port = ${local_port}
+
+sys.stderr.write('[Tunnel] Connecting to relay: %s\n' % relay)
+
+# Register
+try:
+    req = urllib.request.Request(relay + '/register', method='GET')
+    with urllib.request.urlopen(req, timeout=10) as r:
+        data = json.loads(r.read())
+    tid = data['tunnel_id']
+    pub_url = data['public_url']
+    sys.stderr.write('[Tunnel] Registered! ID: %s\n' % tid)
+    sys.stderr.write('[Tunnel] Public URL: %s\n' % pub_url)
+except Exception as e:
+    sys.stderr.write('[Tunnel] Registration failed: %s\n' % e)
+    sys.exit(1)
+
+# Main loop: poll for requests, forward to local, send response back
+while True:
+    try:
+        poll_url = relay + '/poll/' + tid
+        req = urllib.request.Request(poll_url, method='GET')
+        with urllib.request.urlopen(req, timeout=${TUNNEL_POLL_TIMEOUT}) as r:
+            data = json.loads(r.read())
+
+        if not data or data.get('req_id') is None:
+            continue
+
+        rid = data['req_id']
+        method = data.get('method', 'GET')
+        path = data.get('path', '/')
+        body = data.get('body', '')
+        headers = data.get('headers', {})
+
+        sys.stderr.write('[Tunnel] Request: %s %s\\n' % (method, path))
+
+        # Forward to local server
+        local_url = 'http://localhost:%d%s' % (local_port, path)
+        forward_headers = {'Content-Type': 'application/json'}
+        fwd_body = body.encode('utf-8') if body else None
+
+        try:
+            fwd_req = urllib.request.Request(
+                local_url,
+                data=fwd_body,
+                headers=forward_headers,
+                method=method
+            )
+            with urllib.request.urlopen(fwd_req, timeout=120) as fr:
+                resp_body = fr.read()
+                resp_status = fr.status
+                resp_headers = dict(fr.getheaders())
+
+            respond_data = {
+                'status': resp_status,
+                'headers': {'Content-Type': resp_headers.get('Content-Type', 'application/json')},
+                'body': resp_body.decode('utf-8', errors='replace')
+            }
+        except urllib.request.HTTPError as he:
+            respond_data = {
+                'status': he.code,
+                'headers': {'Content-Type': 'text/plain'},
+                'body': he.read().decode('utf-8', errors='replace')
+            }
+        except Exception as e:
+            respond_data = {
+                'status': 502,
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({'error': str(e)})
+            }
+
+        # Send response back to relay
+        resp_url = relay + '/respond/' + rid
+        resp_req = urllib.request.Request(
+            resp_url,
+            data=json.dumps(respond_data).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='POST'
+        )
+        with urllib.request.urlopen(resp_req, timeout=10) as rr:
+            pass
+
+        sys.stderr.write('[Tunnel] Response: %s\\n' % respond_data['status'])
+
+    except urllib.request.HTTPError as he:
+        if he.code != 204:  # 204 = no pending requests (timeout)
+            sys.stderr.write('[Tunnel] Poll error: %s\\n' % he)
+            time.sleep(1)
+    except Exception as e:
+        sys.stderr.write('[Tunnel] Error: %s\\n' % e)
+        time.sleep(1)
+"
+}
+
 # ---- Status / Info --------------------------------------------------------
 
 show_status() {
@@ -1848,10 +2144,40 @@ main() {
         proxy|api-proxy)
             api_proxy_server
             ;;
+        tunnel)
+            tunnel_client "${2:-}" "${3:-}"
+            ;;
+        tunnel-server)
+            tunnel_server "${2:-}"
+            ;;
         *)
+            # Auto-tunnel via MINILLM_TUNNEL env var
+            if [ -n "${MINILLM_TUNNEL:-}" ]; then
+                local relay_parts
+                IFS=':' read -ra relay_parts <<< "${MINILLM_TUNNEL}"
+                local rhost="${relay_parts[0]}"
+                local rport="${relay_parts[1]:-8081}"
+                # Start server in background, then tunnel
+                header "Starting with Auto-Tunnel"
+                info "Relay: ${rhost}:${rport}"
+                echo ""
+                local model="$1"
+                shift 2>/dev/null || true
+                if [ $# -ge 1 ]; then
+                    warn "Auto-tunnel only works in server mode. Use: ${SCRIPT_NAME} tunnel"
+                    generate "$model" "$*"
+                else
+                    MINILLM_PORT="$PORT" "$BINARY" "$model" &
+                    local server_pid=$!
+                    sleep 2
+                    tunnel_client "$rhost" "$rport"
+                    kill "$server_pid" 2>/dev/null || true
+                fi
+                return
+            fi
+
             # API proxy mode: if MINILLM_API_URL is set and no model arg
             if [ -n "${API_URL}" ] && [ $# -ge 1 ] && [ ! -f "$1" ]; then
-                # First arg is not a file - treat as prompt via API proxy
                 generate_via_api "$*"
             elif [ -n "${API_URL}" ] && [ $# -eq 0 ]; then
                 api_proxy_server
