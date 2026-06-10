@@ -462,10 +462,14 @@ static int64_t gguf_get_kv_i64(gguf_file_t *gf, const char *key, int64_t def) {
  * Dequantization
  * ============================================================ */
 
+static float read_f32_unaligned(const void *p) {
+    float v; memcpy(&v, p, 4); return v;
+}
+
 static void dequant_q4_0(float *out, const uint8_t *raw, int n) {
     int n_blocks = n / 32;
     for (int b = 0; b < n_blocks; b++) {
-        float d = *(const float*)(raw + b * 18 + 16);
+        float d = read_f32_unaligned(raw + b * 18 + 16);
         const uint8_t *qs = raw + b * 18;
         for (int i = 0; i < 16; i++) {
             uint8_t q = qs[i];
@@ -478,8 +482,8 @@ static void dequant_q4_0(float *out, const uint8_t *raw, int n) {
 static void dequant_q4_1(float *out, const uint8_t *raw, int n) {
     int n_blocks = n / 32;
     for (int b = 0; b < n_blocks; b++) {
-        float d = *(const float*)(raw + b * 20 + 16);
-        float m = *(const float*)(raw + b * 20 + 20);
+        float d = read_f32_unaligned(raw + b * 20 + 16);
+        float m = read_f32_unaligned(raw + b * 20 + 20);
         const uint8_t *qs = raw + b * 20;
         for (int i = 0; i < 16; i++) {
             uint8_t q = qs[i];
@@ -492,7 +496,7 @@ static void dequant_q4_1(float *out, const uint8_t *raw, int n) {
 static void dequant_q8_0(float *out, const uint8_t *raw, int n) {
     int n_blocks = n / 32;
     for (int b = 0; b < n_blocks; b++) {
-        float d = *(const float*)(raw + b * 33 + 32);
+        float d = read_f32_unaligned(raw + b * 33 + 32);
         const int8_t *qs = (const int8_t*)(raw + b * 33);
         for (int i = 0; i < 32; i++)
             out[b * 32 + i] = (float)qs[i] * d;
