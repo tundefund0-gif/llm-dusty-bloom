@@ -19,6 +19,13 @@ A **self-contained LLM inference engine** in a single bash file. Auto-extracts, 
 - **Model download** — `./minillm download <url> [name]` with progress bar
 - **Demo download** — `./minillm demo` downloads TinyLlama-1.1B Q4_0
 
+### NVIDIA / External API Proxy
+- **API proxy mode** — use any OpenAI-compatible API (NVIDIA, OpenAI, Azure, local Ollama)
+- **Set & forget** — configure with `MINILLM_API_URL` and `MINILLM_API_KEY`
+- **Unified interface** — same `/api/generate` endpoint whether local or cloud
+- **CLI via API** — `./minillm "Your prompt"` automatically uses the API if configured
+- **Auto-format detection** — adapts payload format for chat/completions endpoints
+
 ### Management
 - **Auto-build** — extracts and compiles embedded C engine on first run
 - **Platform detection** — auto-selects optimal compiler flags for your CPU
@@ -128,6 +135,36 @@ curl http://localhost:8080/api/tags
 curl http://localhost:8080/api/version
 ```
 
+### NVIDIA / External API Proxy
+
+Use any OpenAI-compatible API as the backend instead of running models locally.
+
+```bash
+# NVIDIA AI Foundation API
+export MINILLM_API_URL="https://api.nvcf.nvidia.com/v1/chat/completions"
+export MINILLM_API_KEY="nvapi-xxxxxxxxxxxx"
+
+# Start proxy server (API mode)
+./minillm
+
+# Or use OpenAI
+export MINILLM_API_URL="https://api.openai.com/v1/chat/completions"
+export MINILLM_API_KEY="sk-xxxxxxxxxxxx"
+./minillm
+
+# Or a local Ollama server
+export MINILLM_API_URL="http://localhost:11434/api/generate"
+./minillm
+
+# CLI mode via API (no model file needed)
+./minillm "What is the meaning of life?"
+
+# Or start explicitly
+./minillm proxy
+```
+
+The proxy provides the exact same `/api/generate`, `/api/tags`, `/api/version` endpoints. Switch between local and cloud by setting/unsetting `MINILLM_API_URL`.
+
 ### Interactive Chat
 ```bash
 ./minillm chat model.gguf
@@ -174,6 +211,8 @@ sudo ./minillm install
 |----------|---------|-------------|
 | `MINILLM_PORT` | `8080` | HTTP API server port |
 | `MINILLM_CACHE` | `~/.cache/minillm` | Cache directory for engine and models |
+| `MINILLM_API_URL` | — | External API endpoint (NVIDIA, OpenAI, Ollama, etc.) |
+| `MINILLM_API_KEY` | — | API key for external endpoint |
 | `CC` | `gcc` | C compiler for building engine |
 
 ### Cache Structure

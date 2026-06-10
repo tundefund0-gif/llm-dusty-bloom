@@ -52,6 +52,8 @@ BINARY="${CACHE_DIR}/minillm"
 MODELS_DIR="${CACHE_DIR}/models"
 BUILD_DIR="${CACHE_DIR}/src"
 PORT="${MINILLM_PORT:-8080}"
+API_URL="${MINILLM_API_URL:-}"
+API_KEY="${MINILLM_API_KEY:-}"
 
 # ---- Colors ----------------------------------------------------------------
 
@@ -96,6 +98,8 @@ ${BOLD}Options:${NC}
 ${BOLD}Environment:${NC}
   MINILLM_PORT     Server port (default: 8080)
   MINILLM_CACHE    Cache directory (default: ~/.cache/minillm)
+  MINILLM_API_URL  External API endpoint (NVIDIA, OpenAI, etc.)
+  MINILLM_API_KEY  API key for external endpoint
 
 ${BOLD}Examples:${NC}
   ${SCRIPT_NAME} download ${YELLOW}https://huggingface.co/TheBloke/.../model.gguf${NC}
@@ -1295,7 +1299,78 @@ list_models() {
     info "Use: ${SCRIPT_NAME} download <url> [name]"
 }
 
-# ---- Text Generation ------------------------------------------------------
+# ---- Text Generation via API Proxy (CLI mode) ----------------------------
+
+generate_via_api() {
+    local prompt="$*"
+
+    if [ -z "$API_URL" ]; then
+        error "MINILLM_API_URL not set"
+        exit 1
+    fi
+
+    info "Using API: ${API_URL}"
+    info "Generating..."
+
+    local payload
+    if echo "$API_URL" | grep -qi "chat"; then
+        payload=$(cat <<JSON
+{
+  "model": "gpt-3.5-turbo",
+  "messages": [{"role": "user", "content": $(printf '%s' "$prompt" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))")}],
+  "max_tokens": 256,
+  "temperature": 0.7
+}
+JSON
+        )
+    else
+        payload=$(cat <<JSON
+{
+  "prompt": $(printf '%s' "$prompt" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))"),
+  "max_tokens": 256,
+  "temperature": 0.7
+}
+JSON
+        )
+    fi
+
+    local auth_header=""
+    if [ -n "$API_KEY" ]; then
+        auth_header="-H \"Authorization: Bearer ${API_KEY}\""
+    fi
+
+    local response
+    response=$(eval curl -s "$API_URL" \
+        -H "Content-Type: application/json" \
+        $auth_header \
+        -d "$payload" 2>/dev/null)
+
+    local text=""
+    text=$(echo "$response" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    if 'response' in d:
+        print(d['response'])
+    elif 'choices' in d and len(d['choices']) > 0:
+        c = d['choices'][0]
+        if 'message' in c and 'content' in c['message']:
+            print(c['message']['content'])
+        elif 'text' in c:
+            print(c['text'])
+except:
+    pass" 2>/dev/null)
+
+    if [ -n "$text" ]; then
+        echo "$text"
+    else
+        warn "No response or error:"
+        echo "$response" | head -c 500
+        echo ""
+    fi
+}
+
+# ---- Text Generation (Local) ----------------------------------------------
 
 generate() {
     local model="$1"
@@ -1427,9 +1502,144 @@ chat_mode() {
     cleanup
 }
 
-# ---- HTTP API Server ------------------------------------------------------
+# ---- API Proxy Server (NVIDIA/OpenAI/etc) -----------------------------------
+
+api_proxy_server() {
+    header "Starting API Proxy Server"
+    info "Backend: ${API_URL}"
+    info "Port:    ${PORT}"
+    echo ""
+    info "Requests to /api/generate are forwarded to the external API"
+    echo ""
+
+    local tmpfile
+    tmpfile=$(mktemp)
+
+    cat > "$tmpfile" << 'PYEOF'
+import http.server, json, urllib.request, sys, os, signal
+
+class ProxyHandler(http.server.BaseHTTPRequestHandler):
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
+
+    def do_POST(self):
+        if '/api/generate' in self.path:
+            body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+            try:
+                data = json.loads(body)
+            except:
+                self.json_response(400, {'error': 'bad json'})
+                return
+
+            prompt = data.get('prompt', '')
+            max_tokens = data.get('max_tokens', 256)
+            temperature = data.get('temperature', 0.7)
+
+            api_url = os.environ.get('MINILLM_API_URL', '')
+            api_key = os.environ.get('MINILLM_API_KEY', '')
+
+            if not api_url:
+                self.json_response(500, {'error': 'MINILLM_API_URL not set'})
+                return
+
+            headers = {'Content-Type': 'application/json'}
+            if api_key:
+                headers['Authorization'] = f'Bearer {api_key}'
+
+            if 'openai.azure.com' in api_url:
+                payload = json.dumps({
+                    'messages': [{'role': 'user', 'content': prompt}],
+                    'max_tokens': max_tokens,
+                    'temperature': temperature
+                }).encode()
+            elif '/v1/chat/completions' in api_url:
+                payload = json.dumps({
+                    'model': data.get('model', 'gpt-3.5-turbo'),
+                    'messages': [{'role': 'user', 'content': prompt}],
+                    'max_tokens': max_tokens,
+                    'temperature': temperature
+                }).encode()
+            elif '/v1/completions' in api_url:
+                payload = json.dumps({
+                    'prompt': prompt,
+                    'max_tokens': max_tokens,
+                    'temperature': temperature
+                }).encode()
+            else:
+                payload = json.dumps({
+                    'prompt': prompt,
+                    'max_tokens': max_tokens,
+                    'temperature': temperature
+                }).encode()
+
+            try:
+                req = urllib.request.Request(api_url, data=payload, headers=headers, method='POST')
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    result = json.loads(resp.read())
+                    response_text = ''
+                    if 'response' in result:
+                        response_text = result['response']
+                    elif 'choices' in result and len(result['choices']) > 0:
+                        c = result['choices'][0]
+                        if 'message' in c and 'content' in c['message']:
+                            response_text = c['message']['content']
+                        elif 'text' in c:
+                            response_text = c['text']
+                    self.json_response(200, {'response': response_text, 'model': 'api-proxy', 'done': True})
+            except Exception as e:
+                self.json_response(502, {'error': str(e)})
+        else:
+            self.json_response(404, {'error': 'not found'})
+
+    def do_GET(self):
+        if '/api/tags' in self.path:
+            self.json_response(200, {'models': [{'name': 'api-proxy', 'size': 0}]})
+        elif '/api/version' in self.path:
+            self.json_response(200, {'version': '0.3.0'})
+        else:
+            self.json_response(404, {'error': 'not found'})
+
+    def json_response(self, code, data):
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write('[API Proxy] %s\n' % (fmt % args))
+
+def shutdown(sig, frame):
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, shutdown)
+signal.signal(signal.SIGINT, shutdown)
+
+port = int(os.environ.get('MINILLM_PORT', '8080'))
+server = http.server.HTTPServer(('0.0.0.0', port), ProxyHandler)
+sys.stderr.write(f'API Proxy running on port {port}\n')
+sys.stderr.flush()
+server.serve_forever()
+PYEOF
+
+    python3 "$tmpfile"
+    rm -f "$tmpfile"
+}
+
+# ---- HTTP API Server (Local) -----------------------------------------------
 
 http_server() {
+    if [ -n "${API_URL}" ]; then
+        warn "MINILLM_API_URL is set - starting proxy mode instead of local server"
+        echo ""
+        api_proxy_server
+        return
+    fi
+
     local model="$1"
 
     if [ ! -f "$model" ]; then
@@ -1452,34 +1662,6 @@ http_server() {
     echo ""
 
     MINILLM_PORT="$PORT" exec "$BINARY" "$model"
-}
-
-# ---- Status / Info --------------------------------------------------------
-
-show_status() {
-    header "minillm Status"
-    info "Version: $VERSION"
-    detect_platform
-
-    if [ -x "$BINARY" ]; then
-        local size
-        size=$(stat -c%s "$BINARY" 2>/dev/null || stat -f%z "$BINARY" 2>/dev/null || echo "0")
-        size=$(( size / 1024 ))
-        ok "Engine: built (${size}KB)"
-    else
-        warn "Engine: not built (run '${SCRIPT_NAME} build')"
-    fi
-
-    if [ -d "$MODELS_DIR" ] && [ "$(ls -A "$MODELS_DIR" 2>/dev/null)" ]; then
-        local count
-        count=$(ls "$MODELS_DIR" | wc -l)
-        ok "Models cached: $count"
-    else
-        warn "No models cached"
-    fi
-
-    echo ""
-    info "Cache dir: $CACHE_DIR"
 }
 
 # ---- Model Remove ----------------------------------------------------------
@@ -1597,6 +1779,9 @@ show_status() {
     info "Cache dir: $CACHE_DIR"
     info "Engine:    $BINARY"
     info "Models:    $MODELS_DIR"
+    if [ -n "${API_URL}" ]; then
+        info "API Proxy: ${API_URL}"
+    fi
     info "Config:    MINILLM_PORT=${PORT}"
 }
 
@@ -1660,14 +1845,25 @@ main() {
         --version|-v)
             echo "minillm v$VERSION"
             ;;
+        proxy|api-proxy)
+            api_proxy_server
+            ;;
         *)
-            local model="$1"
-            shift 2>/dev/null || true
-
-            if [ $# -ge 1 ]; then
-                generate "$model" "$*"
+            # API proxy mode: if MINILLM_API_URL is set and no model arg
+            if [ -n "${API_URL}" ] && [ $# -ge 1 ] && [ ! -f "$1" ]; then
+                # First arg is not a file - treat as prompt via API proxy
+                generate_via_api "$*"
+            elif [ -n "${API_URL}" ] && [ $# -eq 0 ]; then
+                api_proxy_server
             else
-                http_server "$model"
+                local model="$1"
+                shift 2>/dev/null || true
+
+                if [ $# -ge 1 ]; then
+                    generate "$model" "$*"
+                else
+                    http_server "$model"
+                fi
             fi
             ;;
     esac
