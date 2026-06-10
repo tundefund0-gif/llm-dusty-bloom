@@ -199,7 +199,7 @@ extract_source() {
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#ifdef __ARM_NEON
+#if defined(__aarch64__)
 #include <arm_neon.h>
 #define HAS_NEON 1
 #else
@@ -1218,8 +1218,8 @@ build_engine() {
             if [ -n "${TERMUX_VERSION:-}" ] || [ "$(uname -o 2>/dev/null)" = "Android" ]; then
                 float_abi="softfp"
             fi
-            cflags="$cflags -march=armv7-a -mfpu=neon -mfloat-abi=${float_abi}"
-            info "ARMv7 with NEON (${float_abi})"
+            cflags="$cflags -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=${float_abi}"
+            info "ARMv7 with VFP (${float_abi})"
             ;;
         aarch64)
             cflags="$cflags -march=armv8-a"
