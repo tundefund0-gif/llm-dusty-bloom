@@ -528,10 +528,15 @@ static float *dequant_tensor(gguf_file_t *gf, int idx) {
         ne *= gf->tensors[idx].dims[d];
 
     size_t raw_sz = gguf_tensor_size(gf, idx);
-    uint8_t *raw = malloc(raw_sz);
+    fprintf(stderr, "DBG: dequant '%s' ne=%zu raw_sz=%zu type=%d\n",
+            gf->tensors[idx].name, ne, raw_sz, gf->tensors[idx].type);
+    uint8_t *raw = malloc(raw_sz ? raw_sz : 1);
+    fprintf(stderr, "DBG: malloc raw=%p\n", (void*)raw);
     gguf_read_tensor_data(gf, idx, raw);
+    fprintf(stderr, "DBG: fread done\n");
 
     float *out = malloc(ne * sizeof(float));
+    fprintf(stderr, "DBG: malloc out=%p\n", (void*)out);
     enum gguf_tensor_type t = gf->tensors[idx].type;
 
     static int printed = 0;
@@ -833,20 +838,34 @@ static model_t load_model(gguf_file_t *gf) {
     }
     fprintf(stderr, "\n");
 
+    fprintf(stderr, "DBG: loading token_embd\n");
     int idx = gguf_find_tensor(gf, "token_embd.weight");
     if (idx < 0) idx = gguf_find_tensor(gf, "embed_tokens.weight");
     if (idx >= 0) {
         m.n_vocab = gf->tensors[idx].dims[0];
+        fprintf(stderr, "DBG: dequant token_embd (vocab=%d)\n", m.n_vocab);
         m.token_embd = dequant_tensor(gf, idx);
+        fprintf(stderr, "DBG: token_embd done\n");
     }
 
+    fprintf(stderr, "DBG: loading output_norm\n");
     idx = gguf_find_tensor(gf, "output_norm.weight");
     if (idx < 0) idx = gguf_find_tensor(gf, "norm.weight");
-    if (idx >= 0) m.output_norm_w = dequant_tensor(gf, idx);
+    if (idx >= 0) {
+        fprintf(stderr, "DBG: dequant output_norm\n");
+        m.output_norm_w = dequant_tensor(gf, idx);
+        fprintf(stderr, "DBG: output_norm done\n");
+    }
 
+    fprintf(stderr, "DBG: loading output.weight\n");
     idx = gguf_find_tensor(gf, "output.weight");
-    if (idx >= 0) m.output_proj_w = dequant_tensor(gf, idx);
+    if (idx >= 0) {
+        fprintf(stderr, "DBG: dequant output.weight\n");
+        m.output_proj_w = dequant_tensor(gf, idx);
+        fprintf(stderr, "DBG: output.weight done\n");
+    }
 
+    fprintf(stderr, "DBG: load_model complete\n");
     return m;
 }
 
@@ -1173,12 +1192,16 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "\nLoading: %s\n", model_path);
     gguf_file_t gf = gguf_open(model_path);
+    fprintf(stderr, "DBG: gguf_open done, data_offset=%zu\n", (size_t)gf.data_offset);
 
     model_t model = load_model(&gf);
+    fprintf(stderr, "DBG: load_model done, loading vocab\n");
     tokenizer_t tok = load_vocab(&gf);
+    fprintf(stderr, "DBG: vocab loaded, n_vocab=%d\n", tok.n_vocab);
     g_model = &model;
     g_tok = &tok;
 
+    fprintf(stderr, "DBG: starting server/main loop\n");
     if (prompt) {
         char *output = calloc(65536, 1);
         fprintf(stderr, "\nPrompt: %s\n", prompt);
