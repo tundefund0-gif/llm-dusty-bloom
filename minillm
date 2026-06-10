@@ -407,7 +407,7 @@ static size_t gguf_tensor_size(gguf_file_t *gf, int idx) {
     switch (t) {
         case GGUF_F32:  return n * 4;
         case GGUF_F16:  return n * 2;
-        case GGUF_Q8_0: return (n / 32) * 33;
+        case GGUF_Q8_0: return (n / 32) * 34;
         case GGUF_Q4_0: return (n / 32) * 18;
         case GGUF_Q4_1: return (n / 32) * 20;
         case GGUF_Q5_0: return (n / 32) * 22;
@@ -459,14 +459,31 @@ static int64_t gguf_get_kv_i64(gguf_file_t *gf, const char *key, int64_t def) {
  * Dequantization
  * ============================================================ */
 
-static float read_f32_unaligned(const void *p) {
-    float v; memcpy(&v, p, 4); return v;
+static float half_to_float(uint16_t h) {
+    uint32_t sign = (uint32_t)(h >> 15) << 31;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t mantissa = h & 0x3FF;
+    uint32_t f;
+    if (exp == 0) {
+        f = sign | (mantissa << 13);
+    } else if (exp == 31) {
+        f = sign | 0x7F800000 | (mantissa << 13);
+    } else {
+        f = sign | ((exp + 127 - 15) << 23) | (mantissa << 13);
+    }
+    float result;
+    memcpy(&result, &f, 4);
+    return result;
+}
+
+static float read_half(const uint8_t *p) {
+    uint16_t h; memcpy(&h, p, 2); return half_to_float(h);
 }
 
 static void dequant_q4_0(float *out, const uint8_t *raw, int n) {
     int n_blocks = n / 32;
     for (int b = 0; b < n_blocks; b++) {
-        float d = read_f32_unaligned(raw + b * 18 + 16);
+        float d = read_half(raw + b * 18 + 16);
         const uint8_t *qs = raw + b * 18;
         for (int i = 0; i < 16; i++) {
             uint8_t q = qs[i];
@@ -479,8 +496,8 @@ static void dequant_q4_0(float *out, const uint8_t *raw, int n) {
 static void dequant_q4_1(float *out, const uint8_t *raw, int n) {
     int n_blocks = n / 32;
     for (int b = 0; b < n_blocks; b++) {
-        float d = read_f32_unaligned(raw + b * 20 + 16);
-        float m = read_f32_unaligned(raw + b * 20 + 20);
+        float d = read_half(raw + b * 20 + 16);
+        float m = read_half(raw + b * 20 + 18);
         const uint8_t *qs = raw + b * 20;
         for (int i = 0; i < 16; i++) {
             uint8_t q = qs[i];
@@ -493,8 +510,8 @@ static void dequant_q4_1(float *out, const uint8_t *raw, int n) {
 static void dequant_q8_0(float *out, const uint8_t *raw, int n) {
     int n_blocks = n / 32;
     for (int b = 0; b < n_blocks; b++) {
-        float d = read_f32_unaligned(raw + b * 33 + 32);
-        const int8_t *qs = (const int8_t*)(raw + b * 33);
+        float d = read_half(raw + b * 34 + 32);
+        const int8_t *qs = (const int8_t*)(raw + b * 34);
         for (int i = 0; i < 32; i++)
             out[b * 32 + i] = (float)qs[i] * d;
     }
