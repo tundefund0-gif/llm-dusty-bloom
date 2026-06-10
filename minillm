@@ -743,6 +743,29 @@ static const char *detokenize(tokenizer_t *tok, int id) {
     return "?";
 }
 
+static void clean_output(char *out) {
+    char *r = out, *w = out;
+    while (*r) {
+        int skip = 0;
+        if (r[0] == '<') {
+            char *end = strchr(r, '>');
+            if (end && end - r <= 12) { skip = (int)(end - r + 1); }
+        }
+        if (skip) {
+            r += skip;
+            continue;
+        }
+        if ((unsigned char)r[0] == 0xC4 && (unsigned char)r[1] == 0xA0) {
+            *w++ = ' '; r += 2;
+        } else if ((unsigned char)r[0] == 0xE2 && (unsigned char)r[1] == 0x96 && (unsigned char)r[2] == 0x81) {
+            *w++ = ' '; r += 3;
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = '\0';
+}
+
 /* ============================================================
  * Model
  * ============================================================ */
@@ -995,6 +1018,7 @@ static int generate(model_t *m, tokenizer_t *tok, const char *prompt,
         }
     }
 
+    clean_output(out);
     free(hidden); free(residual); free(q); free(k); free(v);
     free(att_out); free(ff_tmp); free(att_scores);
     free(k_cache); free(v_cache);
