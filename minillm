@@ -172,9 +172,6 @@ install_deps() {
 
 extract_source() {
     mkdir -p "$BUILD_DIR"
-    if [ -f "$SOURCE_C" ] && [ -s "$SOURCE_C" ]; then
-        return 0
-    fi
     info "Extracting embedded engine source..."
     mkdir -p "$BUILD_DIR"
 
@@ -2121,7 +2118,7 @@ main() {
             build_engine
             ;;
         rebuild)
-            rm -f "$BINARY"
+            rm -f "$BINARY" "$SOURCE_C"
             detect_platform
             check_deps
             extract_source
