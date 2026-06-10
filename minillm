@@ -1219,8 +1219,12 @@ build_engine() {
 
     case "$ARCH" in
         armv7l)
-            cflags="$cflags -march=armv7-a -mfpu=neon -mfloat-abi=hard"
-            info "ARMv7 with NEON"
+            local float_abi="hard"
+            if [ -n "${TERMUX_VERSION:-}" ] || [ "$(uname -o 2>/dev/null)" = "Android" ]; then
+                float_abi="softfp"
+            fi
+            cflags="$cflags -march=armv7-a -mfpu=neon -mfloat-abi=${float_abi}"
+            info "ARMv7 with NEON (${float_abi})"
             ;;
         aarch64)
             cflags="$cflags -march=armv8-a"
